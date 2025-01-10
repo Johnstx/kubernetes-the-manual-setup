@@ -680,3 +680,644 @@ cfssl gencert \
   admin-csr.json | cfssljson -bare admin
 }
 ```
+7.  Certificate and Private key for **Token Controller**
+
+**Token Controller**: a part of the Kubernetes Controller Manager ```kube-controller-manager``` responsible for generating and signing service account tokens which are used by *pods* or other *resources* to establish connectivity to the ```api-server```. Read more about Service Accounts from the [official documentation.](https://kubernetes.io/docs/reference/access-authn-authz/service-accounts-admin/)
+
+```
+{
+
+cat > service-account-csr.json <<EOF
+{
+  "CN": "service-accounts",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "UK",
+      "L": "England",
+      "O": "Kubernetes",
+      "OU": "staxx.io",
+      "ST": "London"
+    }
+  ]
+}
+EOF
+
+cfssl gencert \
+  -ca=ca.pem \
+  -ca-key=ca-key.pem \
+  -config=ca-config.json \
+  -profile=kubernetes \
+  service-account-csr.json | cfssljson -bare service-account
+}
+``` 
+
+#### Step 4 - Distributing the Client and Server Certificates
+
+Send all the client and server certificates created earlier to their respective instances.
+
+Begin with certificates that for the **worker nodes**
+
+Copy these files securely to the worker nodes using **scp** utility.
+
+* Root CA  certificate - ca.pem
+* X509 Certificate for each worker node
+* Private Key of the certificate for each worker node
+
+```
+for i in 0 1 2; do
+  instance="${NAME}-worker-${i}"
+  external_ip=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${instance}" \
+    --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  scp -i ../ssh/${NAME}.id_rsa \
+    ca.pem ${instance}-key.pem ${instance}.pem ubuntu@${external_ip}:~/; \
+done
+``` 
+![alt text](<images/distributing client and server certs.jpg>)
+
+
+
+**Master or Controller node**: - Note that only the ```api-server``` related files will be sent over to the master nodes.
+
+```
+for i in 0 1 2; do
+instance="${NAME}-master-${i}" \
+  external_ip=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${instance}" \
+    --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  scp -i ../ssh/${NAME}.id_rsa \
+    ca.pem ca-key.pem service-account-key.pem service-account.pem \
+    master-kubernetes.pem master-kubernetes-key.pem ubuntu@${external_ip}:~/;
+done
+```
+
+The ```kube-proxy```, ```kube-controller-manager```, ```kube-scheduler```, and ```kubelet client certificates``` will be used to generate client authentication configuration files later.
+
+#### Step 5 Use ```kubectl``` to Generate Kubernetes Configuration Files for Authentication
+
+To ensure the kubernetes cluster runs as it should, a file known as ```kubeconfig``` must be created. This file enables lubernetes clients to locate and authenticate to the kubernetes API Servers.
+The client tool ```kubectl``` will be used to do this.
+
+Generate kubeconfig files for the **kubelet**, **controller manager**, **kube-proxy**, and **scheduler clients** and then the **admin** user. 
+First, create a few environement variables for reuse by multiple commands.
+
+```
+KUBERNETES_API_SERVER_ADDRESS=$(aws elbv2 describe-load-balancers --load-balancer-arns ${LOAD_BALANCER_ARN} --output text --query 'LoadBalancers[].DNSName')
+``` 
+1. Generate the **kubelet** kubeconfig file
+
+For each of the nodes running the kubelet component, it is very important that the client certificate configured for that node is used to generate the kubeconfig. This is because each certificate has the node's DNS name or IP Address configured at the time the certificate was generated. It will also ensure that the appropriate authorization is applied to that node through the [Node Authorizer](https://kubernetes.io/docs/reference/access-authn-authz/node/)
+
+Run the below command in the directory where all the certificates were generated.
+
+```
+for i in 0 1 2; do
+
+instance="${NAME}-worker-${i}"
+instance_hostname="ip-172-31-0-2${i}"
+
+# Set the kubernetes cluster in the kubeconfig file
+  kubectl config set-cluster ${NAME} \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://$KUBERNETES_API_SERVER_ADDRESS:6443 \
+    --kubeconfig=${instance}.kubeconfig
+
+# Set the cluster credentials in the kubeconfig file
+  kubectl config set-credentials system:node:${instance_hostname} \
+    --client-certificate=${instance}.pem \
+    --client-key=${instance}-key.pem \
+    --embed-certs=true \
+    --kubeconfig=${instance}.kubeconfig
+
+# Set the context in the kubeconfig file
+  kubectl config set-context default \
+    --cluster=${NAME} \
+    --user=system:node:${instance_hostname} \
+    --kubeconfig=${instance}.kubeconfig
+
+  kubectl config use-context default --kubeconfig=${instance}.kubeconfig
+done
+``` 
+
+Inspect the **output**, List the  output
+
+```
+ls -ltr *.kubeconfig
+```
+![alt text](images/step4.jpg)
+
+Open up the ```kubeconfig``` files generated and review the 3 different sections that have been configured:
+**Reacall:** Kubeconfig file stores information about a kubernetes cluster, inclusind authentication credentials and cluster specific settings.
+
+A ```Kubeconfig``` file contains:
+
+* Cluster
+* Credentials
+* And Kube context
+
+By default, ```kubectl``` looks for a file named ```config``` in the ```$HOME/.kube``` directory. You can specify other kubeconfig files by setting the KUBECONFIG environment variable or by setting the ```--kubeconfig``` flag. 
+
+To get to know more how to create your own kubeconfig files - read[ this documentation.](https://kubernetes.io/docs/concepts/configuration/organize-cluster-access-kubeconfig/)
+
+**Context** part of ```kubeconfig``` file defines three main parameters: cluster, namespace and user. You can save several different contexts with any convenient names and switch between them when needed.
+
+```
+kubectl config use-context %context-name%
+```
+2. Generate the kube-proxy kubeconfig
+
+```
+{
+  kubectl config set-cluster ${NAME} \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://${KUBERNETES_API_SERVER_ADDRESS}:6443 \
+    --kubeconfig=kube-proxy.kubeconfig
+
+  kubectl config set-credentials system:kube-proxy \
+    --client-certificate=kube-proxy.pem \
+    --client-key=kube-proxy-key.pem \
+    --embed-certs=true \
+    --kubeconfig=kube-proxy.kubeconfig
+
+  kubectl config set-context default \
+    --cluster=${NAME} \
+    --user=system:kube-proxy \
+    --kubeconfig=kube-proxy.kubeconfig
+
+  kubectl config use-context default --kubeconfig=kube-proxy.kubeconfig
+}
+
+``` 
+
+3. Generate the **Kube-Controller-Manager** kubeconfig
+Notice that the ```--server``` is set to use ```127.0.0.1```. This is because, this component runs on the API-Server so there is no point routing through the Load Balancer
+
+```
+{
+  kubectl config set-cluster ${NAME} \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://127.0.0.1:6443 \
+    --kubeconfig=kube-controller-manager.kubeconfig
+
+  kubectl config set-credentials system:kube-controller-manager \
+    --client-certificate=kube-controller-manager.pem \
+    --client-key=kube-controller-manager-key.pem \
+    --embed-certs=true \
+    --kubeconfig=kube-controller-manager.kubeconfig
+
+  kubectl config set-context default \
+    --cluster=${NAME} \
+    --user=system:kube-controller-manager \
+    --kubeconfig=kube-controller-manager.kubeconfig
+
+  kubectl config use-context default --kubeconfig=kube-controller-manager.kubeconfig
+}
+``` 
+
+4. Generating the **Kube-Scheduler** Kubeconfig
+
+```
+{
+  kubectl config set-cluster ${NAME} \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://127.0.0.1:6443 \
+    --kubeconfig=kube-scheduler.kubeconfig
+
+  kubectl config set-credentials system:kube-scheduler \
+    --client-certificate=kube-scheduler.pem \
+    --client-key=kube-scheduler-key.pem \
+    --embed-certs=true \
+    --kubeconfig=kube-scheduler.kubeconfig
+
+  kubectl config set-context default \
+    --cluster=${NAME} \
+    --user=system:kube-scheduler \
+    --kubeconfig=kube-scheduler.kubeconfig
+
+  kubectl config use-context default --kubeconfig=kube-scheduler.kubeconfig
+}
+```
+
+5. Finally, generate the kubeconfig file for the **admin user**
+
+```
+{
+  kubectl config set-cluster ${NAME} \
+    --certificate-authority=ca.pem \
+    --embed-certs=true \
+    --server=https://${KUBERNETES_API_SERVER_ADDRESS}:6443 \
+    --kubeconfig=admin.kubeconfig
+
+  kubectl config set-credentials admin \
+    --client-certificate=admin.pem \
+    --client-key=admin-key.pem \
+    --embed-certs=true \
+    --kubeconfig=admin.kubeconfig
+
+  kubectl config set-context default \
+    --cluster=${NAME} \
+    --user=admin \
+    --kubeconfig=admin.kubeconfig
+
+  kubectl config use-context default --kubeconfig=admin.kubeconfig
+}
+```
+
+**Lets Distribute the files to their respective servers, using ```scp``` and a ```for``` loop**
+
+**For the worker nodes**  - send the ```kubelet``` and ```kube-proxy``` kubeconfigs
+
+```
+for i in 0 1 2; do
+  instance="${NAME}-worker-${i}"
+  external_ip=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${instance}" \
+    --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  scp -i ../ssh/${NAME}.id_rsa \
+	${instance}.kubeconfig kube-proxy.kubeconfig \
+	ubuntu@${external_ip}:~/; 
+done
+```
+![alt text](<images/kubeconfigs sent to worker nodes instances.jpg>)
+
+
+**For the master nodes**  - send the ```admin.kubeconfig```, ```kube-scheduler.kubeconfig```, and  ```kube-controller-manager.kubeconfig```
+
+```
+for i in 0 1 2; do
+instance="${NAME}-master-${i}" 
+  external_ip=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${instance}" \
+    --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  scp -i ../ssh/${NAME}.id_rsa \
+    admin.kubeconfig kube-scheduler.kubeconfig kube-controller-manager.kubeconfig \
+    ubuntu@${external_ip}:~/;
+done
+```
+![alt text](<images/kubeconfigs sent to master nodes instances.jpg>)
+
+
+**Step 5 Secure the ```etcd``` database with encryption at rest.**
+```etcd```  is  a distrributed key-value store which kubernetes uses to store data like *cluster state, application configurations, secrets, configmaps etc*. By default, the data that is being persisted to the disk is not encryped, and therefore prone to attack by any party that gains access to the database. This risk is handled by encrypting the etcd.
+
+We will encrypt ```etcd```at rest. Meaning that the data is stored and persists on a disk.
+"in-flight" or "in transit" refers to data that is being transferred over the network. 
+"In-flight" encryption is done through TLS.
+
+**Generate the encryption key and encode it using base64**
+
+```
+ETCD_ENCRYPTION_KEY=$(head -c 32 /dev/urandom | base64) 
+``` 
+
+
+See the output that will be generated when called. Yours will be a different random string.
+
+```
+echo $ETCD_ENCRYPTION_KEY
+```
+
+**OUTPUT:**
+
+```
+OuxSvV5XUQVid4fNNbeyFEDTUPr1yozZPQ+E6Eqj80m1FSVDB6jOHt9miD/7kMdJIvVshlMgxY80wFajlqItug===$
+``` 
+
+**Create an ```encryption-config.yamL``` file as documented officially by kubernetes**
+
+```
+cat > encryption-config.yaml <<EOF
+kind: EncryptionConfig
+apiVersion: v1
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: ${ETCD_ENCRYPTION_KEY}
+      - identity: {}
+EOF
+```
+
+The encryption file will be sent to the **Controller nodes** using ```scp``` and a ```for``` loop.
+
+```
+for i in 0 1 2; do
+instance="${NAME}-master-${i}" 
+  external_ip=$(aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=${instance}" \
+    --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  scp -i ../ssh/${NAME}.id_rsa \
+    encryption-config.yaml \
+    ubuntu@${external_ip}:~/;
+done
+``` 
+
+#### Bootstrap ```etcd``` cluster
+
+The primary purpose of the etcd component is to store the state of the cluster. This is because Kubernetes itself is stateless. Therefore, all its stateful data will persist in etcd. Since Kubernetes is a distributed system - it needs a distributed storage to keep persistent data in it. etcd is a highly-available key value store that fits the purpose. All K8s cluster configurations are stored in a form of key value pairs in etcd, it also stores the actual and desired states of the cluster. etcd cluster is intelligent enough to watch for changes made on one instance and almost instantly replicate those changes to the rest of the instances, so all of them will be always reconciled.
+
+**PS**: [tmux](https://youtu.be/Yl7NFenTgIo) will be used to work with multiple terminal sessions simultaneously.
+
+1. SSH into the controller server
+
+* Master 1
+
+```
+  master_1_ip=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=${NAME}-master-0" \
+  --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  ssh -i k8s-manual-setup.id_rsa  ubuntu@${master_1_ip}
+```
+
+
+* Master 2
+
+```
+master_2_ip=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=${NAME}-master-1" \
+  --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  ssh -i k8s-manual-setup.id_rsa  ubuntu@${master_2_ip}
+```
+
+
+* Master 3
+
+```
+master_3_ip=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=${NAME}-master-2" \
+  --output text --query 'Reservations[].Instances[].PublicIpAddress')
+  ssh -i k8s-manual-setup.id_rsa  ubuntu@${master_3_ip}
+```
+Working tmux enables you to do these things faster in different instances/windows.
+For example below
+
+![alt text](<images/reach AIP publicly.jpg>)
+
+2. Download and install **etcd**
+
+```
+  wget -q --show-progress --https-only --timestamping \
+  "https://github.com/etcd-io/etcd/releases/download/v3.4.15/etcd-v3.4.15-linux-amd64.tar.gz"
+```
+
+3. Extract and install the etcd server and the etcdctl command line utility:
+
+```
+{
+  tar -xvf etcd-v3.4.15-linux-amd64.tar.gz
+  sudo mv etcd-v3.4.15-linux-amd64/etcd* /usr/local/bin/
+}
+``` 
+
+4. Configure the **etcd** server
+
+```
+{
+  sudo mkdir -p /etc/etcd /var/lib/etcd
+  sudo chmod 700 /var/lib/etcd
+  sudo cp ca.pem master-kubernetes-key.pem master-kubernetes.pem /etc/etcd/
+}
+```
+5. The instance internal IP address will be used to serve client requests and communicate with ``` etcd``` cluster peers. To Retrieve the internal IP address for the current compute instance,
+
+run
+
+```
+export INTERNAL_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+```
+6. Each ```etcd``` member must have a unique name within an ```etcd``` cluster. Set the``` etcd``` name to node Private IP address so it will uniquely identify the machine:
+
+7. Create the ```etcd.service``` systemd unit file:
+
+The flags are well documented [here](https://www.bookstack.cn/read/etcd-3.2.17-en/717bafd59fa87192.md)
+
+```
+cat <<EOF | sudo tee /etc/systemd/system/etcd.service
+[Unit]
+Description=etcd
+Documentation=https://github.com/coreos
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/etcd \\
+  --name ${ETCD_NAME} \\
+  --trusted-ca-file=/etc/etcd/ca.pem \\
+  --peer-trusted-ca-file=/etc/etcd/ca.pem \\
+  --peer-client-cert-auth \\
+  --client-cert-auth \\
+  --listen-peer-urls https://${INTERNAL_IP}:2380 \\
+  --listen-client-urls https://${INTERNAL_IP}:2379,https://127.0.0.1:2379 \\
+  --advertise-client-urls https://${INTERNAL_IP}:2379 \\
+  --initial-cluster-token etcd-cluster-0 \\
+  --initial-cluster master-0=https://172.31.0.10:2380,master-1=https://172.31.0.11:2380,master-2=https://172.31.0.12:2380 \\
+  --cert-file=/etc/etcd/master-kubernetes.pem \\
+  --key-file=/etc/etcd/master-kubernetes-key.pem \\
+  --peer-cert-file=/etc/etcd/master-kubernetes.pem \\
+  --peer-key-file=/etc/etcd/master-kubernetes-key.pem \\
+  --initial-advertise-peer-urls https://${INTERNAL_IP}:2380 \\
+  --initial-cluster-state new \\
+  --data-dir=/var/lib/etcd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+``` 
+
+8. Start and enable the ```etcd``` Server
+
+```
+{
+  sudo systemctl daemon-reload
+  sudo systemctl enable etcd
+  sudo systemctl start etcd
+}
+```
+
+9. Verify the ```etcd``` installation
+
+```
+sudo ETCDCTL_API=3 etcdctl member list \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/etcd/ca.pem \
+  --cert=/etc/etcd/master-kubernetes.pem \
+  --key=/etc/etcd/master-kubernetes-key.pem
+``` 
+
+OUTPUT 
+
+![alt text](<images/verify etcd.jpg>)
+
+```
+systemctl status etcd
+``` 
+
+![alt text](<images/systemctl status etcd.jpg>)
+
+Using tmux, run same on ther other master node instances.
+
+![alt text](<images/etcd verify 2 runnning.jpg>)
+
+
+
+####  Bootstrap the `Control Plane`
+Here, we will configure the components for the plane on the master/controller nodes.
+
+1. Create the Kubernetes configuration directory:
+```
+sudo mkdir -p /etc/kubernetes/config
+```
+
+2. Download the official Kubernetes release binaries:
+
+
+```
+wget -q --show-progress --https-only --timestamping \
+  "https://storage.googleapis.com/kubernetes-release/release/v1.21.0/bin/linux/amd64/kube-apiserver" \
+  "https://storage.googleapis.com/kubernetes-release/release/v1.21.0/bin/linux/amd64/kube-controller-manager" \
+  "https://storage.googleapis.com/kubernetes-release/release/v1.21.0/bin/linux/amd64/kube-scheduler" \
+  "https://storage.googleapis.com/kubernetes-release/release/v1.21.0/bin/linux/amd64/kubectl"
+```
+
+3. Install the Kubernetes binaries:
+
+```
+{
+  chmod +x kube-apiserver kube-controller-manager kube-scheduler kubectl
+  sudo mv kube-apiserver kube-controller-manager kube-scheduler kubectl /usr/local/bin/
+}
+``` 
+4. Configure the Kubernetes API Server:
+
+```
+{
+  sudo mkdir -p /var/lib/kubernetes/
+
+  sudo mv ca.pem ca-key.pem master-kubernetes-key.pem master-kubernetes.pem \
+    service-account-key.pem service-account.pem \
+    encryption-config.yaml /var/lib/kubernetes/
+}
+``` 
+![alt text](<images/masters - etcd config final setup.jpg>)
+
+The instance internal IP address will be used to advertise the API Server to members of the cluster. Retrieve the internal IP address for the current compute instance:
+
+```export INTERNAL_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+``` 
+
+Create the kube-apiserver.service systemd unit file: [Ensure to read each startup flag used in below systemd file from the documentation here](https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/)
+
+```
+cat <<EOF | sudo tee /etc/systemd/system/kube-apiserver.service
+[Unit]
+Description=Kubernetes API Server
+Documentation=https://github.com/kubernetes/kubernetes
+
+[Service]
+ExecStart=/usr/local/bin/kube-apiserver \\
+  --advertise-address=${INTERNAL_IP} \\
+  --allow-privileged=true \\
+  --apiserver-count=3 \\
+  --audit-log-maxage=30 \\
+  --audit-log-maxbackup=3 \\
+  --audit-log-maxsize=100 \\
+  --audit-log-path=/var/log/audit.log \\
+  --authorization-mode=Node,RBAC \\
+  --bind-address=0.0.0.0 \\
+  --client-ca-file=/var/lib/kubernetes/ca.pem \\
+  --enable-admission-plugins=NamespaceLifecycle,NodeRestriction,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota \\
+  --etcd-cafile=/var/lib/kubernetes/ca.pem \\
+  --etcd-certfile=/var/lib/kubernetes/master-kubernetes.pem \\
+  --etcd-keyfile=/var/lib/kubernetes/master-kubernetes-key.pem\\
+  --etcd-servers=https://172.31.0.10:2379,https://172.31.0.11:2379,https://172.31.0.12:2379 \\
+  --event-ttl=1h \\
+  --encryption-provider-config=/var/lib/kubernetes/encryption-config.yaml \\
+  --kubelet-certificate-authority=/var/lib/kubernetes/ca.pem \\
+  --kubelet-client-certificate=/var/lib/kubernetes/master-kubernetes.pem \\
+  --kubelet-client-key=/var/lib/kubernetes/master-kubernetes-key.pem \\
+  --runtime-config='api/all=true' \\
+  --service-account-key-file=/var/lib/kubernetes/service-account.pem \\
+  --service-account-signing-key-file=/var/lib/kubernetes/service-account-key.pem \\
+  --service-account-issuer=https://${INTERNAL_IP}:6443 \\
+  --service-cluster-ip-range=172.32.0.0/24 \\
+  --service-node-port-range=30000-32767 \\
+  --tls-cert-file=/var/lib/kubernetes/master-kubernetes.pem \\
+  --tls-private-key-file=/var/lib/kubernetes/master-kubernetes-key.pem \\
+  --v=2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+5. Configure the Kubernetes **Controller Manager:**
+
+Move the kube-controller-manager kubeconfig into place:
+
+```
+sudo mv kube-controller-manager.kubeconfig /var/lib/kubernetes/
+``` 
+
+Export some variables to retrieve the ```vpc_cidr``` - This will be required for the ```bind-address``` flag:
+
+```
+export AWS_METADATA="http://169.254.169.254/latest/meta-data"
+export EC2_MAC_ADDRESS=$(curl -s $AWS_METADATA/network/interfaces/macs/ | head -n1 | tr -d '/')
+export VPC_CIDR=$(curl -s $AWS_METADATA/network/interfaces/macs/$EC2_MAC_ADDRESS/vpc-ipv4-cidr-block/)
+export NAME=k8s-manual-setup
+``` 
+
+Create the kube-controller-manager.service systemd unit file:
+
+```
+cat <<EOF | sudo tee /etc/systemd/system/kube-controller-manager.service
+[Unit]
+Description=Kubernetes Controller Manager
+Documentation=https://github.com/kubernetes/kubernetes
+
+[Service]
+ExecStart=/usr/local/bin/kube-controller-manager \\
+  --bind-address=0.0.0.0 \\
+  --cluster-cidr=${VPC_CIDR} \\
+  --cluster-name=${NAME} \\
+  --cluster-signing-cert-file=/var/lib/kubernetes/ca.pem \\
+  --cluster-signing-key-file=/var/lib/kubernetes/ca-key.pem \\
+  --kubeconfig=/var/lib/kubernetes/kube-controller-manager.kubeconfig \\
+  --authentication-kubeconfig=/var/lib/kubernetes/kube-controller-manager.kubeconfig \\
+  --authorization-kubeconfig=/var/lib/kubernetes/kube-controller-manager.kubeconfig \\
+  --leader-elect=true \\
+  --root-ca-file=/var/lib/kubernetes/ca.pem \\
+  --service-account-private-key-file=/var/lib/kubernetes/service-account-key.pem \\
+  --service-cluster-ip-range=172.32.0.0/24 \\
+  --use-service-account-credentials=true \\
+  --v=2
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+6. Configure the **Kubernetes Scheduler:**
+
+Move the kube-scheduler kubeconfig into place:
+
+```
+sudo mv kube-scheduler.kubeconfig /var/lib/kubernetes/
+sudo mkdir -p /etc/kubernetes/config
+``` 
