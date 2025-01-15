@@ -1990,8 +1990,8 @@ EOF
 }
 ```
 
-*All systems should be GREEN!*
-Check the status of the nodes and ensure they are READY.  
+*All systems should be **GREEN!***
+Check the status of the nodes and ensure they are **READY**.  
 
 ![alt text](<images/WORKER worker nodes ready.jpg>)
 
