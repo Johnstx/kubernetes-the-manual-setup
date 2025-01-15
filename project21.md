@@ -1997,3 +1997,7 @@ Check the status of the nodes and ensure they are **READY**.
 ![alt text](<images/WORKER worker nodes ready.jpg>)
 
 
+
+We have demonstrated how software development of an application can be immensely immproved upon with **containerization**, we have further highlighted that applications can be orchestrated accross multiple servers using **kubernetes**.
+
+[**NEXT**](https://github.com/Johnstx/Project_22-Deploying-Applications-Into-Kubernetes-Cluster.git), Lets deploy an application into a **kubernetes** cluster.
