@@ -1,3 +1,4 @@
+### Cluster Set Up
 
 For the cluster, create 6 EC2 instances, which will have the following movings parts properly configured:
 
